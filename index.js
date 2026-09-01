@@ -24,18 +24,35 @@ function ensureDatabase() {
 
   databaseReady ??= pool
     .query(`
-      CREATE TABLE IF NOT EXISTS wix_webhook_events (
-        id BIGSERIAL PRIMARY KEY,
-        event_id TEXT,
-        request_id TEXT NOT NULL,
-        event_type TEXT NOT NULL,
-        instance_id TEXT,
-        payload JSONB NOT NULL,
-        event_data JSONB,
-        received_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        UNIQUE (event_id)
-      )
-    `)
+        CREATE TABLE IF NOT EXISTS wix_webhook_events (
+          id BIGSERIAL PRIMARY KEY,
+          event_id TEXT,
+          request_id TEXT NOT NULL,
+          event_type TEXT NOT NULL,
+          instance_id TEXT,
+          app_id TEXT,
+          origin_instance_id TEXT,
+          webhook_id TEXT,
+          identity_type TEXT,
+          wix_user_id TEXT,
+          owner_email TEXT,
+          payload JSONB NOT NULL,
+          event_data JSONB,
+          received_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          UNIQUE (event_id)
+        )
+      `)
+    .then(() =>
+      pool.query(`
+        ALTER TABLE wix_webhook_events
+          ADD COLUMN IF NOT EXISTS app_id TEXT,
+          ADD COLUMN IF NOT EXISTS origin_instance_id TEXT,
+          ADD COLUMN IF NOT EXISTS webhook_id TEXT,
+          ADD COLUMN IF NOT EXISTS identity_type TEXT,
+          ADD COLUMN IF NOT EXISTS wix_user_id TEXT,
+          ADD COLUMN IF NOT EXISTS owner_email TEXT
+      `),
+    )
     .catch((err) => {
       databaseReady = undefined;
       throw err;
@@ -47,13 +64,25 @@ function ensureDatabase() {
 async function saveWebhookEvent({ requestId, payload, event, eventData }) {
   await ensureDatabase();
 
-  const eventId = payload.id ?? event.id ?? null;
+  const identity =
+    typeof eventData?.identity === "string"
+      ? JSON.parse(eventData.identity)
+      : eventData?.identity ?? {};
+  const eventId =
+    payload.id ??
+    event.id ??
+    event.webhookId ??
+    eventData?.id ??
+    eventData?.webhookId ??
+    null;
 
   const result = await pool.query(
     `
       INSERT INTO wix_webhook_events
-        (event_id, request_id, event_type, instance_id, payload, event_data)
-      VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb)
+        (event_id, request_id, event_type, instance_id, app_id,
+         origin_instance_id, webhook_id, identity_type, wix_user_id,
+         owner_email, payload, event_data)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12::jsonb)
       ON CONFLICT (event_id) DO NOTHING
       RETURNING id, event_id, received_at
     `,
@@ -62,6 +91,12 @@ async function saveWebhookEvent({ requestId, payload, event, eventData }) {
       requestId,
       event.eventType,
       event.instanceId ?? null,
+      eventData?.appId ?? null,
+      eventData?.originInstanceId ?? null,
+      eventData?.webhookId ?? null,
+      identity.identityType ?? null,
+      identity.wixUserId ?? null,
+      eventData?.ownerEmail ?? eventData?.ownerInfo?.email ?? null,
       JSON.stringify(payload),
       eventData == null ? null : JSON.stringify(eventData),
     ],
@@ -173,7 +208,14 @@ app.post("/webhook", express.text({ type: "*/*", limit: "1mb" }), async (request
       inserted: saveResult.inserted,
       duplicate: !saveResult.inserted,
       databaseRowId: saveResult.row?.id ?? null,
-      savedEventId: saveResult.row?.event_id ?? payload.id ?? event.id ?? null,
+      savedEventId:
+        saveResult.row?.event_id ??
+        payload.id ??
+        event.id ??
+        event.webhookId ??
+        eventData?.id ??
+        eventData?.webhookId ??
+        null,
       savedAt: saveResult.row?.received_at ?? null,
     });
   } catch (err) {
