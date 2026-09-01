@@ -1,6 +1,31 @@
-const jwt = require("jsonwebtoken");
-const express = require("express");
+import express from "express";
+import jwt from "jsonwebtoken";
+import { randomUUID } from "node:crypto";
+
 const app = express();
+
+app.use((request, response, next) => {
+  const requestId = request.get("x-request-id") || randomUUID();
+  const startedAt = Date.now();
+
+  response.set("x-request-id", requestId);
+  console.log("[request:start]", {
+    requestId,
+    method: request.method,
+    path: request.originalUrl,
+    contentType: request.get("content-type") || null,
+  });
+
+  response.on("finish", () => {
+    console.log("[request:finish]", {
+      requestId,
+      statusCode: response.statusCode,
+      durationMs: Date.now() - startedAt,
+    });
+  });
+
+  next();
+});
 
 // server.js
 //
@@ -26,35 +51,77 @@ y3Pm1JoSiZ07m7UbjuIOXrLgXgYZ3hbmcvNwZaDCVAjC3C0RPMl0IGxLOEgS9FmX
 hQIDAQAB
 -----END PUBLIC KEY-----`;
 
-app.post('/webhook', express.text(), (request, response) => {
+app.get("/health", (_request, response) => {
+  response.status(200).json({ status: "ok" });
+});
+
+app.post("/webhook", express.text({ type: "*/*", limit: "1mb" }), (request, response) => {
+  const requestId = response.get("x-request-id");
+  const rawBody = typeof request.body === "string" ? request.body : "";
+
+  console.log("[webhook:received]", {
+    requestId,
+    bodyBytes: Buffer.byteLength(rawBody, "utf8"),
+    hasBody: rawBody.length > 0,
+    hasWixSignature: Boolean(request.get("x-wix-signature")),
+  });
+
   let event;
   let eventData;
 
   try {
-    const rawPayload = jwt.verify(request.body, PUBLIC_KEY);
-    event = JSON.parse(rawPayload.data);
-    eventData = JSON.parse(event.data);
+    const rawPayload = jwt.verify(rawBody, PUBLIC_KEY);
+    const payload = typeof rawPayload === "string" ? JSON.parse(rawPayload) : rawPayload;
+
+    event = typeof payload.data === "string" ? JSON.parse(payload.data) : payload.data;
+    eventData = typeof event.data === "string" ? JSON.parse(event.data) : event.data;
   } catch (err) {
-    console.error(err);
-    response.status(400).send(`Webhook error: ${err.message}`);
+    console.error("[webhook:error]", {
+      requestId,
+      name: err instanceof Error ? err.name : typeof err,
+      message: err instanceof Error ? err.message : String(err),
+    });
+    response.status(400).send("Invalid webhook");
     return;
   }
 
   switch (event.eventType) {
     case "AppInstalled":
-      console.log(`AppInstalled event received with data:`, eventData);
-      console.log(`App instance ID:`, event.instanceId);
+      console.log("[wix:app-installed]", {
+        requestId,
+        hasEventData: eventData !== undefined && eventData !== null,
+        instanceId: event.instanceId,
+      });
       //
       // handle your event here
       //
       break;
     default:
-      console.log(`Received unknown event type: ${event.eventType}`);
+      console.log("[wix:unknown-event]", {
+        requestId,
+        eventType: event.eventType,
+      });
       break;
   }
 
-  response.status(200).send();
-
+  console.log("[webhook:processed]", { requestId, eventType: event.eventType });
+  response.sendStatus(200);
 });
 
-app.listen(3000, () => console.log("Server started on port 3000"));
+app.use((err, request, response, _next) => {
+  console.error("[request:error]", {
+    method: request.method,
+    path: request.originalUrl,
+    name: err instanceof Error ? err.name : typeof err,
+    message: err instanceof Error ? err.message : String(err),
+  });
+  response.status(400).send("Invalid request");
+});
+
+const port = Number(process.env.PORT) || 3000;
+
+if (!process.env.VERCEL) {
+  app.listen(port, () => console.log("[server:started]", { port }));
+}
+
+export default app;

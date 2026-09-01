@@ -17,6 +17,7 @@
     "@wix/sdk": "^1.21.16",
     "dotenv": "^17.4.2",
     "express": "^4.22.2",
+    "jsonwebtoken": "^9.0.3",
     "pg": "^8.23.0"
   },
   "devDependencies": {
