@@ -31,11 +31,20 @@ function ensureDatabase() {
           event_type TEXT NOT NULL,
           instance_id TEXT,
           app_id TEXT,
+          app_name TEXT,
           origin_instance_id TEXT,
           webhook_id TEXT,
           identity_type TEXT,
           wix_user_id TEXT,
           owner_email TEXT,
+          operation_timestamp TIMESTAMPTZ,
+          vendor_product_id TEXT,
+          cycle TEXT,
+          previous_vendor_product_id TEXT,
+          previous_cycle TEXT,
+          coupon_name TEXT,
+          invoice_id TEXT,
+          expires_on TIMESTAMPTZ,
           payload JSONB NOT NULL,
           event_data JSONB,
           received_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -46,11 +55,20 @@ function ensureDatabase() {
       pool.query(`
         ALTER TABLE wix_webhook_events
           ADD COLUMN IF NOT EXISTS app_id TEXT,
+          ADD COLUMN IF NOT EXISTS app_name TEXT,
           ADD COLUMN IF NOT EXISTS origin_instance_id TEXT,
           ADD COLUMN IF NOT EXISTS webhook_id TEXT,
           ADD COLUMN IF NOT EXISTS identity_type TEXT,
           ADD COLUMN IF NOT EXISTS wix_user_id TEXT,
-          ADD COLUMN IF NOT EXISTS owner_email TEXT
+          ADD COLUMN IF NOT EXISTS owner_email TEXT,
+          ADD COLUMN IF NOT EXISTS operation_timestamp TIMESTAMPTZ,
+          ADD COLUMN IF NOT EXISTS vendor_product_id TEXT,
+          ADD COLUMN IF NOT EXISTS cycle TEXT,
+          ADD COLUMN IF NOT EXISTS previous_vendor_product_id TEXT,
+          ADD COLUMN IF NOT EXISTS previous_cycle TEXT,
+          ADD COLUMN IF NOT EXISTS coupon_name TEXT,
+          ADD COLUMN IF NOT EXISTS invoice_id TEXT,
+          ADD COLUMN IF NOT EXISTS expires_on TIMESTAMPTZ
       `),
     )
     .catch((err) => {
@@ -79,10 +97,13 @@ async function saveWebhookEvent({ requestId, payload, event, eventData }) {
   const result = await pool.query(
     `
       INSERT INTO wix_webhook_events
-        (event_id, request_id, event_type, instance_id, app_id,
+        (event_id, request_id, event_type, instance_id, app_id, app_name,
          origin_instance_id, webhook_id, identity_type, wix_user_id,
-         owner_email, payload, event_data)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12::jsonb)
+         owner_email, operation_timestamp, vendor_product_id, cycle,
+         previous_vendor_product_id, previous_cycle, coupon_name, invoice_id,
+         expires_on, payload, event_data)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+              $14, $15, $16, $17, $18, $19, $20::jsonb, $21::jsonb)
       ON CONFLICT (event_id) DO NOTHING
       RETURNING id, event_id, received_at
     `,
@@ -92,11 +113,20 @@ async function saveWebhookEvent({ requestId, payload, event, eventData }) {
       event.eventType,
       event.instanceId ?? null,
       eventData?.appId ?? null,
+      eventData?.appName ?? event.appName ?? null,
       eventData?.originInstanceId ?? null,
       eventData?.webhookId ?? null,
       identity.identityType ?? null,
       identity.wixUserId ?? null,
       eventData?.ownerEmail ?? eventData?.ownerInfo?.email ?? null,
+      eventData?.operationTimeStamp ?? null,
+      eventData?.vendorProductId ?? null,
+      eventData?.cycle ?? null,
+      eventData?.previousVendorProductId ?? null,
+      eventData?.previousCycle ?? null,
+      eventData?.couponName ?? null,
+      eventData?.invoiceId ?? null,
+      eventData?.expiresOn ?? null,
       JSON.stringify(payload),
       eventData == null ? null : JSON.stringify(eventData),
     ],
@@ -110,31 +140,10 @@ async function saveWebhookEvent({ requestId, payload, event, eventData }) {
 
 const app = express();
 
-console.log("[handler:loaded]", {
-  vercel: Boolean(process.env.VERCEL),
-  nodeVersion: process.version,
-  hasDatabaseUrl: Boolean(process.env.DATABASE_URL),
-});
-
 app.use((request, response, next) => {
   const requestId = request.get("x-request-id") || randomUUID();
-  const startedAt = Date.now();
 
   response.set("x-request-id", requestId);
-  console.log("[request:start]", {
-    requestId,
-    method: request.method,
-    path: request.originalUrl,
-    contentType: request.get("content-type") || null,
-  });
-
-  response.on("finish", () => {
-    console.log("[request:finish]", {
-      requestId,
-      statusCode: response.statusCode,
-      durationMs: Date.now() - startedAt,
-    });
-  });
 
   next();
 });
@@ -171,14 +180,6 @@ app.post("/webhook", express.text({ type: "*/*", limit: "1mb" }), async (request
   const requestId = response.get("x-request-id");
   const rawBody = typeof request.body === "string" ? request.body : "";
 
-  console.log("[webhook:received]", {
-    requestId,
-    body: rawBody,
-    bodyBytes: Buffer.byteLength(rawBody, "utf8"),
-    hasBody: rawBody.length > 0,
-    hasWixSignature: Boolean(request.get("x-wix-signature")),
-  });
-
   let event;
   let eventData;
   let payload;
@@ -189,82 +190,29 @@ app.post("/webhook", express.text({ type: "*/*", limit: "1mb" }), async (request
 
     event = typeof payload.data === "string" ? JSON.parse(payload.data) : payload.data;
     eventData = typeof event.data === "string" ? JSON.parse(event.data) : event.data;
-  } catch (err) {
-    console.error("[webhook:error]", {
-      requestId,
-      name: err instanceof Error ? err.name : typeof err,
-      message: err instanceof Error ? err.message : String(err),
-    });
+  } catch {
     response.status(400).send("Invalid webhook");
     return;
   }
 
   try {
-    const saveResult = await saveWebhookEvent({ requestId, payload, event, eventData });
-    console.log("[webhook:database]", {
-      requestId,
-      eventType: event.eventType,
-      saved: true,
-      inserted: saveResult.inserted,
-      duplicate: !saveResult.inserted,
-      databaseRowId: saveResult.row?.id ?? null,
-      savedEventId:
-        saveResult.row?.event_id ??
-        payload.id ??
-        event.id ??
-        event.webhookId ??
-        eventData?.id ??
-        eventData?.webhookId ??
-        null,
-      savedAt: saveResult.row?.received_at ?? null,
-    });
-  } catch (err) {
-    console.error("[database:error]", {
-      requestId,
-      name: err instanceof Error ? err.name : typeof err,
-      message: err instanceof Error ? err.message : String(err),
-    });
+    await saveWebhookEvent({ requestId, payload, event, eventData });
+  } catch {
     response.status(500).send("Webhook could not be saved");
     return;
   }
 
-  switch (event.eventType) {
-    case "AppInstalled":
-      console.log("[wix:app-installed]", {
-        requestId,
-        hasEventData: eventData !== undefined && eventData !== null,
-        instanceId: event.instanceId,
-      });
-      //
-      // handle your event here
-      //
-      break;
-    default:
-      console.log("[wix:unknown-event]", {
-        requestId,
-        eventType: event.eventType,
-      });
-      break;
-  }
-
-  console.log("[webhook:processed]", { requestId, eventType: event.eventType });
   response.sendStatus(200);
 });
 
-app.use((err, request, response, _next) => {
-  console.error("[request:error]", {
-    method: request.method,
-    path: request.originalUrl,
-    name: err instanceof Error ? err.name : typeof err,
-    message: err instanceof Error ? err.message : String(err),
-  });
+app.use((_err, _request, response, _next) => {
   response.status(400).send("Invalid request");
 });
 
 const port = Number(process.env.PORT) || 3000;
 
 if (!process.env.VERCEL) {
-  app.listen(port, () => console.log("[server:started]", { port }));
+  app.listen(port);
 }
 
 export default app;
