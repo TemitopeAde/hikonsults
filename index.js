@@ -138,6 +138,7 @@ app.post("/webhook", express.text({ type: "*/*", limit: "1mb" }), async (request
 
   console.log("[webhook:received]", {
     requestId,
+    body: rawBody,
     bodyBytes: Buffer.byteLength(rawBody, "utf8"),
     hasBody: rawBody.length > 0,
     hasWixSignature: Boolean(request.get("x-wix-signature")),
@@ -145,10 +146,11 @@ app.post("/webhook", express.text({ type: "*/*", limit: "1mb" }), async (request
 
   let event;
   let eventData;
+  let payload;
 
   try {
     const rawPayload = jwt.verify(rawBody, PUBLIC_KEY);
-    const payload = typeof rawPayload === "string" ? JSON.parse(rawPayload) : rawPayload;
+    payload = typeof rawPayload === "string" ? JSON.parse(rawPayload) : rawPayload;
 
     event = typeof payload.data === "string" ? JSON.parse(payload.data) : payload.data;
     eventData = typeof event.data === "string" ? JSON.parse(event.data) : event.data;
