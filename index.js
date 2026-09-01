@@ -4,6 +4,11 @@ import { randomUUID } from "node:crypto";
 
 const app = express();
 
+console.log("[handler:loaded]", {
+  vercel: Boolean(process.env.VERCEL),
+  nodeVersion: process.version,
+});
+
 app.use((request, response, next) => {
   const requestId = request.get("x-request-id") || randomUUID();
   const startedAt = Date.now();
