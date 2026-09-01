@@ -1,12 +1,84 @@
+import "dotenv/config";
 import express from "express";
 import jwt from "jsonwebtoken";
+import pg from "pg";
 import { randomUUID } from "node:crypto";
+
+const { Pool } = pg;
+
+const pool = process.env.DATABASE_URL
+  ? new Pool({
+      connectionString: process.env.DATABASE_URL,
+      max: 1,
+      idleTimeoutMillis: 10000,
+      connectionTimeoutMillis: 10000,
+    })
+  : null;
+
+let databaseReady;
+
+function ensureDatabase() {
+  if (!pool) {
+    throw new Error("DATABASE_URL is not configured");
+  }
+
+  databaseReady ??= pool
+    .query(`
+      CREATE TABLE IF NOT EXISTS wix_webhook_events (
+        id BIGSERIAL PRIMARY KEY,
+        event_id TEXT,
+        request_id TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        instance_id TEXT,
+        payload JSONB NOT NULL,
+        event_data JSONB,
+        received_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE (event_id)
+      )
+    `)
+    .catch((err) => {
+      databaseReady = undefined;
+      throw err;
+    });
+
+  return databaseReady;
+}
+
+async function saveWebhookEvent({ requestId, payload, event, eventData }) {
+  await ensureDatabase();
+
+  const eventId = payload.id ?? event.id ?? null;
+
+  const result = await pool.query(
+    `
+      INSERT INTO wix_webhook_events
+        (event_id, request_id, event_type, instance_id, payload, event_data)
+      VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb)
+      ON CONFLICT (event_id) DO NOTHING
+      RETURNING id, event_id, received_at
+    `,
+    [
+      eventId,
+      requestId,
+      event.eventType,
+      event.instanceId ?? null,
+      JSON.stringify(payload),
+      eventData == null ? null : JSON.stringify(eventData),
+    ],
+  );
+
+  return {
+    inserted: result.rowCount === 1,
+    row: result.rows[0] ?? null,
+  };
+}
 
 const app = express();
 
 console.log("[handler:loaded]", {
   vercel: Boolean(process.env.VERCEL),
   nodeVersion: process.version,
+  hasDatabaseUrl: Boolean(process.env.DATABASE_URL),
 });
 
 app.use((request, response, next) => {
@@ -60,7 +132,7 @@ app.get("/health", (_request, response) => {
   response.status(200).json({ status: "ok" });
 });
 
-app.post("/webhook", express.text({ type: "*/*", limit: "1mb" }), (request, response) => {
+app.post("/webhook", express.text({ type: "*/*", limit: "1mb" }), async (request, response) => {
   const requestId = response.get("x-request-id");
   const rawBody = typeof request.body === "string" ? request.body : "";
 
@@ -87,6 +159,28 @@ app.post("/webhook", express.text({ type: "*/*", limit: "1mb" }), (request, resp
       message: err instanceof Error ? err.message : String(err),
     });
     response.status(400).send("Invalid webhook");
+    return;
+  }
+
+  try {
+    const saveResult = await saveWebhookEvent({ requestId, payload, event, eventData });
+    console.log("[webhook:database]", {
+      requestId,
+      eventType: event.eventType,
+      saved: true,
+      inserted: saveResult.inserted,
+      duplicate: !saveResult.inserted,
+      databaseRowId: saveResult.row?.id ?? null,
+      savedEventId: saveResult.row?.event_id ?? payload.id ?? event.id ?? null,
+      savedAt: saveResult.row?.received_at ?? null,
+    });
+  } catch (err) {
+    console.error("[database:error]", {
+      requestId,
+      name: err instanceof Error ? err.name : typeof err,
+      message: err instanceof Error ? err.message : String(err),
+    });
+    response.status(500).send("Webhook could not be saved");
     return;
   }
 
